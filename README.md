@@ -15,9 +15,9 @@ Esta primera iteración prioriza foundation:
 
 No incluye todavía:
 
-- integración real con Strava
-- lógica de negocio completa
-- pruebas end-to-end contra BD real
+- pruebas end-to-end reales contra Strava con credenciales de dev válidas
+- lógica de negocio completa aguas abajo del catálogo de actividades
+- workers/colas para sync asíncrono en background
 
 ## Stack
 
@@ -97,6 +97,15 @@ Variables clave:
 - `REFRESH_TOKEN_TTL_DAYS`: duración de sesiones refresh
 - `BOOTSTRAP_ADMIN_EMAIL`: admin inicial opcional
 - `BOOTSTRAP_ADMIN_PASSWORD`: password del admin inicial opcional
+- `STRAVA_CLIENT_ID`: client id de la app Strava de dev
+- `STRAVA_CLIENT_SECRET`: client secret de la app Strava de dev
+- `STRAVA_REDIRECT_URI`: callback backend registrado en Strava, por ejemplo `https://cycling-coach-api.onrender.com/api/v1/strava/callback`
+- `STRAVA_FRONTEND_REDIRECT_URI`: URL de frontend a la que el backend redirige tras completar el callback, por ejemplo `https://cycling-coach-web.vercel.app/integrations/strava/callback`
+- `STRAVA_OAUTH_STATE_TTL_MINUTES`: TTL del state firmado OAuth
+- `STRAVA_DEFAULT_ACTIVITY_LIMIT`: tamaño de sync incremental
+- `STRAVA_FULL_SYNC_MAX_PAGES`: máximo de páginas para import histórico en dev
+- `STRAVA_TOKEN_REFRESH_SKEW_SECONDS`: margen para refrescar token antes del vencimiento real
+- `TOKEN_ENCRYPTION_SECRET`: secreto para cifrar access/refresh tokens persistidos
 
 ## Instalación
 
@@ -120,12 +129,32 @@ pip install -e .[dev]
 uvicorn app.main:app --app-dir src --reload
 ```
 
-Endpoints iniciales:
+Endpoints principales:
 
 - `GET /health`
 - `POST /api/v1/auth/login`
 - `GET /api/v1/auth/me`
 - `GET /api/v1/athletes/me`
+- `GET /api/v1/strava/connect-url`
+- `GET /api/v1/strava/callback`
+- `GET /api/v1/strava/status`
+- `POST /api/v1/strava/sync`
+
+### Flujo Strava en dev
+
+1. El frontend autenticado pide `GET /api/v1/strava/connect-url`.
+2. Redirige al usuario a `authorize_url` en Strava.
+3. Strava vuelve a `STRAVA_REDIRECT_URI` (`/api/v1/strava/callback`).
+4. El backend intercambia el `code`, persiste tokens cifrados y redirige a `STRAVA_FRONTEND_REDIRECT_URI` con query params de estado (`state`, `status`, `connected`, `athlete_id`, `scopes`, `token_expires_at`). Si falla el callback y la petición no pide JSON, también redirige al frontend con `error` y `message`.
+5. El frontend puede refrescar `GET /api/v1/strava/status` y disparar `POST /api/v1/strava/sync`.
+
+Notas de implementación actuales:
+
+- Los tokens se persisten cifrados en `oauth_connections`.
+- El refresh token se rota si Strava devuelve uno nuevo; si no, se conserva el anterior.
+- El backend refresca el access token antes de expirar usando `STRAVA_TOKEN_REFRESH_SKEW_SECONDS`.
+- El sync incremental usa `last_sync_at` como cursor (`after`).
+- El full sync pagina hasta `STRAVA_FULL_SYNC_MAX_PAGES` para no descontrolarse en dev.
 
 ## Testing
 

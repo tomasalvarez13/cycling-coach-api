@@ -4,9 +4,7 @@ import json
 from functools import lru_cache
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices
-
-from pydantic import Field, computed_field, field_validator
+from pydantic import AliasChoices, Field, computed_field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -18,7 +16,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_env: Literal["local", "staging", "production", "test"] = "local"
+    app_env: Literal["local", "development", "staging", "production", "test"] = "local"
     app_name: str = "cycling-coach-api"
     app_debug: bool = False
     api_v1_prefix: str = "/api/v1"
@@ -36,6 +34,12 @@ class Settings(BaseSettings):
     strava_client_id: str | None = None
     strava_client_secret: str | None = None
     strava_redirect_uri: str | None = None
+    strava_frontend_redirect_uri: str | None = None
+    strava_oauth_state_ttl_minutes: int = 15
+    strava_default_activity_limit: int = 30
+    strava_full_sync_max_pages: int = 10
+    strava_token_refresh_skew_seconds: int = 300
+    token_encryption_secret: str | None = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -53,6 +57,13 @@ class Settings(BaseSettings):
                     if isinstance(decoded, list):
                         return [str(item).strip() for item in decoded if str(item).strip()]
             return [item.strip() for item in raw.split(",") if item.strip()]
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: object) -> object:
+        if isinstance(value, str) and value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+psycopg://", 1)
         return value
 
     @computed_field  # type: ignore[prop-decorator]
