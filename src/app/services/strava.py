@@ -15,13 +15,19 @@ from app.core.security import (
     encrypt_secret,
 )
 from app.models.oauth_connection import OAuthConnection
+from app.models.strava_activity import StravaActivity
 from app.models.sync_job import SyncJob
 from app.repositories.oauth_connection import OAuthConnectionRepository
 from app.repositories.strava_activity import StravaActivityRepository
 from app.schemas.strava import (
+    StravaActivitiesOverview,
+    StravaActivityDetail,
+    StravaActivityListResponse,
+    StravaActivitySummary,
     StravaConnectionStatus,
     StravaConnectUrlResponse,
     StravaOAuthCallbackResponse,
+    StravaRecentVolume,
     StravaSyncJobResponse,
 )
 
@@ -140,6 +146,70 @@ class StravaService:
             last_sync_at=connection.last_sync_at,
         )
 
+    def list_activities(
+        self, user_id: str, *, limit: int, offset: int
+    ) -> StravaActivityListResponse:
+        repository = self._require_activities_repository()
+        items = repository.list_for_user(user_id=user_id, limit=limit, offset=offset)
+        total = repository.count_for_user(user_id=user_id)
+        return StravaActivityListResponse(
+            items=[self._serialize_activity_summary(item) for item in items],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_activity_detail(
+        self, user_id: str, *, provider_activity_id: str
+    ) -> StravaActivityDetail:
+        repository = self._require_activities_repository()
+        activity = repository.get_for_user_by_provider_activity_id(
+            user_id=user_id,
+            provider_activity_id=provider_activity_id,
+        )
+        if activity is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Activity not found")
+        return self._serialize_activity_detail(activity)
+
+    def get_activities_overview(self, user_id: str) -> StravaActivitiesOverview:
+        if self.connections is None:
+            raise RuntimeError("Database session required")
+        repository = self._require_activities_repository()
+        connection = self.connections.get_active_for_user(user_id=user_id, provider="strava")
+        if connection is None:
+            return StravaActivitiesOverview(connected=False)
+
+        athlete = (
+            (connection.metadata_json or {}).get("athlete") if connection.metadata_json else None
+        )
+        athlete_name = None
+        if isinstance(athlete, dict):
+            athlete_name = (
+                " ".join(filter(None, [athlete.get("firstname"), athlete.get("lastname")])).strip()
+                or None
+            )
+
+        latest_activities = repository.list_recent_for_user(user_id=user_id, limit=5)
+        recent_volume = [
+            StravaRecentVolume.model_validate(
+                repository.summarize_recent_volume(user_id=user_id, days=7)
+            ),
+            StravaRecentVolume.model_validate(
+                repository.summarize_recent_volume(user_id=user_id, days=30)
+            ),
+        ]
+        return StravaActivitiesOverview(
+            connected=True,
+            athlete_id=connection.provider_user_id,
+            athlete_name=athlete_name,
+            last_sync_at=connection.last_sync_at,
+            total_activities=repository.count_for_user(user_id=user_id),
+            latest_activities=[
+                self._serialize_activity_summary(item) for item in latest_activities
+            ],
+            recent_volume=recent_volume,
+        )
+
     def enqueue_sync(self, user_id: str, *, full_sync: bool) -> StravaSyncJobResponse:
         if self.db is None or self.connections is None or self.activities is None:
             raise RuntimeError("Database session required")
@@ -152,7 +222,9 @@ class StravaService:
             user_id=user_id,
             athlete_id=connection.provider_user_id,
         )
-        effective_full_sync = full_sync or connection.last_sync_at is None or not has_existing_activities
+        effective_full_sync = (
+            full_sync or connection.last_sync_at is None or not has_existing_activities
+        )
 
         started_at = datetime.now(UTC)
         try:
@@ -413,3 +485,34 @@ class StravaService:
 
         query = urlencode(query_params)
         return urlunparse(parsed._replace(query=query))
+
+    def _require_activities_repository(self) -> StravaActivityRepository:
+        if self.activities is None:
+            raise RuntimeError("Database session required")
+        return self.activities
+
+    def _serialize_activity_summary(self, activity: StravaActivity) -> StravaActivitySummary:
+        return StravaActivitySummary(
+            id=str(activity.id),
+            provider_activity_id=activity.provider_activity_id,
+            athlete_id=activity.athlete_id,
+            name=activity.name,
+            sport_type=activity.sport_type,
+            start_date=activity.start_date,
+            timezone=activity.timezone,
+            distance_meters=activity.distance_meters,
+            moving_time_seconds=activity.moving_time_seconds,
+            elapsed_time_seconds=activity.elapsed_time_seconds,
+            total_elevation_gain=activity.total_elevation_gain,
+            average_speed_mps=activity.average_speed_mps,
+            max_speed_mps=activity.max_speed_mps,
+            synced_at=activity.synced_at,
+        )
+
+    def _serialize_activity_detail(self, activity: StravaActivity) -> StravaActivityDetail:
+        return StravaActivityDetail(
+            **self._serialize_activity_summary(activity).model_dump(),
+            raw_json=activity.raw_json,
+            created_at=activity.created_at,
+            updated_at=activity.updated_at,
+        )

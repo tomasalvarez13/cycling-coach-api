@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.strava_activity import StravaActivity
@@ -19,13 +20,75 @@ class StravaActivityRepository:
         )
         return self.db.execute(stmt.limit(1)).scalar_one_or_none() is not None
 
-    def upsert_many(self, *, user_id: str, athlete_id: str, activities: list[dict[str, object]]) -> tuple[int, int]:
+    def list_for_user(self, *, user_id: str, limit: int, offset: int) -> list[StravaActivity]:
+        stmt = (
+            select(StravaActivity)
+            .where(StravaActivity.user_id == user_id)
+            .order_by(StravaActivity.start_date.desc(), StravaActivity.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def count_for_user(self, *, user_id: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(StravaActivity)
+            .where(StravaActivity.user_id == user_id)
+        )
+        return int(self.db.execute(stmt).scalar_one())
+
+    def get_for_user_by_provider_activity_id(
+        self, *, user_id: str, provider_activity_id: str
+    ) -> StravaActivity | None:
+        stmt = select(StravaActivity).where(
+            StravaActivity.user_id == user_id,
+            StravaActivity.provider_activity_id == provider_activity_id,
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def list_recent_for_user(self, *, user_id: str, limit: int) -> list[StravaActivity]:
+        stmt = (
+            select(StravaActivity)
+            .where(StravaActivity.user_id == user_id)
+            .order_by(StravaActivity.start_date.desc(), StravaActivity.created_at.desc())
+            .limit(limit)
+        )
+        return list(self.db.execute(stmt).scalars().all())
+
+    def summarize_recent_volume(self, *, user_id: str, days: int) -> dict[str, Any]:
+        since = datetime.now(UTC) - timedelta(days=days)
+        stmt = select(
+            func.count(StravaActivity.id),
+            func.coalesce(func.sum(StravaActivity.distance_meters), 0.0),
+            func.coalesce(func.sum(StravaActivity.moving_time_seconds), 0),
+            func.coalesce(func.sum(StravaActivity.total_elevation_gain), 0.0),
+        ).where(
+            StravaActivity.user_id == user_id,
+            StravaActivity.start_date >= since,
+        )
+        activity_count, distance_meters, moving_time_seconds, elevation_gain = self.db.execute(
+            stmt
+        ).one()
+        return {
+            "days": days,
+            "activity_count": int(activity_count or 0),
+            "distance_meters": float(distance_meters or 0.0),
+            "moving_time_seconds": int(moving_time_seconds or 0),
+            "elevation_gain": float(elevation_gain or 0.0),
+        }
+
+    def upsert_many(
+        self, *, user_id: str, athlete_id: str, activities: list[dict[str, object]]
+    ) -> tuple[int, int]:
         created = 0
         updated = 0
 
         for item in activities:
             provider_activity_id = str(item["id"])
-            stmt = select(StravaActivity).where(StravaActivity.provider_activity_id == provider_activity_id)
+            stmt = select(StravaActivity).where(
+                StravaActivity.provider_activity_id == provider_activity_id
+            )
             existing = self.db.execute(stmt).scalar_one_or_none()
             if existing is None:
                 activity = StravaActivity(

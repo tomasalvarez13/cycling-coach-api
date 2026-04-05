@@ -7,6 +7,9 @@ from fastapi.responses import RedirectResponse
 
 from app.api.deps import DBSession, get_current_user
 from app.schemas.strava import (
+    StravaActivitiesOverview,
+    StravaActivityDetail,
+    StravaActivityListResponse,
     StravaConnectionStatus,
     StravaConnectUrlResponse,
     StravaOAuthCallbackResponse,
@@ -58,6 +61,35 @@ def get_status(
     db: DBSession, current_user: Any = Depends(get_current_user)
 ) -> StravaConnectionStatus:
     return StravaService(db).get_connection_status(str(current_user.id))
+
+
+@router.get("/activities", response_model=StravaActivityListResponse)
+def list_activities(
+    db: DBSession,
+    current_user: Any = Depends(get_current_user),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> StravaActivityListResponse:
+    return StravaService(db).list_activities(str(current_user.id), limit=limit, offset=offset)
+
+
+@router.get("/activities/overview", response_model=StravaActivitiesOverview)
+def get_activities_overview(
+    db: DBSession, current_user: Any = Depends(get_current_user)
+) -> StravaActivitiesOverview:
+    return StravaService(db).get_activities_overview(str(current_user.id))
+
+
+@router.get("/activities/{provider_activity_id}", response_model=StravaActivityDetail)
+def get_activity_detail(
+    provider_activity_id: str,
+    db: DBSession,
+    current_user: Any = Depends(get_current_user),
+) -> StravaActivityDetail:
+    return StravaService(db).get_activity_detail(
+        str(current_user.id),
+        provider_activity_id=provider_activity_id,
+    )
 
 
 @router.post("/sync", response_model=StravaSyncJobResponse, status_code=status.HTTP_202_ACCEPTED)

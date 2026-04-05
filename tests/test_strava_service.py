@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -40,11 +41,30 @@ class FakeConnections:
 
 
 class FakeActivities:
-    def __init__(self, *, has_any: bool, upsert_result: tuple[int, int] = (0, 0)) -> None:
+    def __init__(
+        self,
+        *,
+        has_any: bool = False,
+        upsert_result: tuple[int, int] = (0, 0),
+        listed: list[object] | None = None,
+        total: int = 0,
+        detail: object | None = None,
+        recent: list[object] | None = None,
+        summary_by_days: dict[int, dict[str, object]] | None = None,
+    ) -> None:
         self.has_any = has_any
         self.upsert_result = upsert_result
+        self.listed = listed or []
+        self.total = total
+        self.detail = detail
+        self.recent = recent or []
+        self.summary_by_days = summary_by_days or {}
         self.has_any_calls: list[tuple[str, str]] = []
         self.upsert_calls: list[tuple[str, str, list[dict[str, object]]]] = []
+        self.list_calls: list[tuple[str, int, int]] = []
+        self.detail_calls: list[tuple[str, str]] = []
+        self.recent_calls: list[tuple[str, int]] = []
+        self.summary_calls: list[tuple[str, int]] = []
 
     def has_any_for_athlete(self, *, user_id: str, athlete_id: str) -> bool:
         self.has_any_calls.append((user_id, athlete_id))
@@ -53,6 +73,48 @@ class FakeActivities:
     def upsert_many(self, *, user_id: str, athlete_id: str, activities: list[dict[str, object]]):
         self.upsert_calls.append((user_id, athlete_id, activities))
         return self.upsert_result
+
+    def list_for_user(self, *, user_id: str, limit: int, offset: int):
+        self.list_calls.append((user_id, limit, offset))
+        return self.listed
+
+    def count_for_user(self, *, user_id: str) -> int:
+        assert user_id == "user-abc"
+        return self.total
+
+    def get_for_user_by_provider_activity_id(self, *, user_id: str, provider_activity_id: str):
+        self.detail_calls.append((user_id, provider_activity_id))
+        return self.detail
+
+    def list_recent_for_user(self, *, user_id: str, limit: int):
+        self.recent_calls.append((user_id, limit))
+        return self.recent
+
+    def summarize_recent_volume(self, *, user_id: str, days: int):
+        self.summary_calls.append((user_id, days))
+        return self.summary_by_days[days]
+
+
+def _make_activity(*, provider_activity_id: str, name: str = "Morning Ride"):
+    return SimpleNamespace(
+        id=uuid4(),
+        provider_activity_id=provider_activity_id,
+        athlete_id="athlete-1",
+        name=name,
+        sport_type="Ride",
+        start_date=datetime(2026, 4, 5, 7, 0, tzinfo=UTC),
+        timezone="(GMT+00:00) UTC",
+        distance_meters=42000.0,
+        moving_time_seconds=5400,
+        elapsed_time_seconds=5700,
+        total_elevation_gain=680.0,
+        average_speed_mps=7.8,
+        max_speed_mps=15.2,
+        synced_at=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
+        raw_json={"id": int(provider_activity_id), "name": name},
+        created_at=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 4, 5, 9, 5, tzinfo=UTC),
+    )
 
 
 def test_build_connect_url_includes_signed_state(monkeypatch) -> None:
@@ -70,18 +132,110 @@ def test_build_connect_url_includes_signed_state(monkeypatch) -> None:
 
 
 def test_get_connection_status_without_connection() -> None:
-    class FakeConnections:
+    class FakeConnectionsWithoutConnection:
         def get_active_for_user(self, *, user_id: str, provider: str):
             assert user_id == "user-abc"
             assert provider == "strava"
             return None
 
     service = StravaService(db=object())
-    service.connections = FakeConnections()
+    service.connections = FakeConnectionsWithoutConnection()
 
     response = service.get_connection_status("user-abc")
 
     assert response.connected is False
+
+
+def test_list_activities_returns_paginated_real_data() -> None:
+    service = StravaService(db=DummyDB())
+    first = _make_activity(provider_activity_id="101")
+    second = _make_activity(provider_activity_id="102", name="Evening Ride")
+    service.activities = FakeActivities(listed=[first, second], total=7)
+
+    response = service.list_activities("user-abc", limit=2, offset=4)
+
+    assert response.total == 7
+    assert response.limit == 2
+    assert response.offset == 4
+    assert [item.provider_activity_id for item in response.items] == ["101", "102"]
+
+
+def test_get_activity_detail_returns_raw_payload() -> None:
+    service = StravaService(db=DummyDB())
+    activity = _make_activity(provider_activity_id="555")
+    service.activities = FakeActivities(detail=activity)
+
+    response = service.get_activity_detail("user-abc", provider_activity_id="555")
+
+    assert response.provider_activity_id == "555"
+    assert response.raw_json == {"id": 555, "name": "Morning Ride"}
+
+
+def test_get_activity_detail_raises_404_when_missing() -> None:
+    service = StravaService(db=DummyDB())
+    service.activities = FakeActivities(detail=None)
+
+    with pytest.raises(HTTPException) as exc_info:
+        service.get_activity_detail("user-abc", provider_activity_id="999")
+
+    assert exc_info.value.status_code == 404
+
+
+def test_get_activities_overview_returns_minimum_useful_summary() -> None:
+    db = DummyDB()
+    service = StravaService(db=db)
+    connection = SimpleNamespace(
+        provider_user_id="athlete-1",
+        last_sync_at=datetime(2026, 4, 5, 12, 0, tzinfo=UTC),
+        metadata_json={"athlete": {"firstname": "Tom", "lastname": "Alvarez"}},
+    )
+    service.connections = FakeConnections(connection)
+    latest = [
+        _make_activity(provider_activity_id="701"),
+        _make_activity(provider_activity_id="702"),
+    ]
+    service.activities = FakeActivities(
+        total=12,
+        recent=latest,
+        summary_by_days={
+            7: {
+                "days": 7,
+                "activity_count": 3,
+                "distance_meters": 120000.0,
+                "moving_time_seconds": 14400,
+                "elevation_gain": 1800.0,
+            },
+            30: {
+                "days": 30,
+                "activity_count": 12,
+                "distance_meters": 480000.0,
+                "moving_time_seconds": 57600,
+                "elevation_gain": 7200.0,
+            },
+        },
+    )
+
+    response = service.get_activities_overview("user-abc")
+
+    assert response.connected is True
+    assert response.athlete_name == "Tom Alvarez"
+    assert response.total_activities == 12
+    assert [item.provider_activity_id for item in response.latest_activities] == ["701", "702"]
+    assert [
+        (item.days, item.activity_count) for item in response.recent_volume
+    ] == [(7, 3), (30, 12)]
+
+
+def test_get_activities_overview_without_connection_returns_disconnected() -> None:
+    service = StravaService(db=DummyDB())
+    service.connections = FakeConnections(None)
+    service.activities = FakeActivities()
+
+    response = service.get_activities_overview("user-abc")
+
+    assert response.connected is False
+    assert response.total_activities == 0
+    assert response.latest_activities == []
 
 
 def test_refresh_access_token_keeps_existing_refresh_token_when_provider_omits_rotation(
@@ -175,7 +329,7 @@ def test_enqueue_sync_promotes_first_sync_to_historical(monkeypatch) -> None:
         access_token=strava_module.encrypt_secret("access-1"),
     )
     service.connections = FakeConnections(connection)
-    service.activities = FakeActivities(has_any=False, upsert_result=(2, 0))
+    service.activities = FakeActivities(has_any=True, upsert_result=(2, 0))
 
     captured: list[bool] = []
 
@@ -307,4 +461,3 @@ def test_build_frontend_callback_error_redirect_includes_error_payload(monkeypat
     assert "error=oauth_callback_failed" in redirect_to
     assert "message=Strava+token+exchange+failed" in redirect_to
     assert "state=signed-state-2" in redirect_to
-
