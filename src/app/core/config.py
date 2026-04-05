@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import AliasChoices
 
 from pydantic import Field, computed_field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://postgres:postgres@localhost:5432/cycling_coach"
     )
-    cors_origins: list[str] = Field(default_factory=list)
+    cors_origins: Annotated[list[str], NoDecode] = Field(default_factory=list)
     jwt_secret: str = Field(default="change-me-in-dev", validation_alias=AliasChoices("JWT_SECRET"))
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 30
