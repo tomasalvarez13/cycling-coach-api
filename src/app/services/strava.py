@@ -148,11 +148,19 @@ class StravaService:
         if connection is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Strava not connected")
 
+        has_existing_activities = self.activities.has_any_for_athlete(
+            user_id=user_id,
+            athlete_id=connection.provider_user_id,
+        )
+        effective_full_sync = full_sync or connection.last_sync_at is None or not has_existing_activities
+
         started_at = datetime.now(UTC)
         try:
             access_token = self._get_valid_access_token(connection)
             activity_payload = self._fetch_activities(
-                access_token=access_token, connection=connection, full_sync=full_sync
+                access_token=access_token,
+                connection=connection,
+                full_sync=effective_full_sync,
             )
             created, updated = self.activities.upsert_many(
                 user_id=user_id,
@@ -160,14 +168,14 @@ class StravaService:
                 activities=activity_payload,
             )
 
-            job_type = "historical_import" if full_sync else "incremental_sync"
+            job_type = "historical_import" if effective_full_sync else "incremental_sync"
             job = SyncJob(
                 user_id=user_id,
                 provider="strava",
                 job_type=job_type,
                 status="completed",
                 payload_json={
-                    "full_sync": full_sync,
+                    "full_sync": effective_full_sync,
                     "requested_at": started_at.isoformat(),
                     "imported_count": created,
                     "updated_count": updated,
@@ -191,7 +199,7 @@ class StravaService:
         except HTTPException as exc:
             self._record_sync_failure(
                 user_id=user_id,
-                full_sync=full_sync,
+                full_sync=effective_full_sync,
                 started_at=started_at,
                 error_message=str(exc.detail),
             )

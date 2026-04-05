@@ -29,6 +29,32 @@ class DummyDB:
         return None
 
 
+class FakeConnections:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    def get_active_for_user(self, *, user_id: str, provider: str):
+        assert user_id == "user-abc"
+        assert provider == "strava"
+        return self.connection
+
+
+class FakeActivities:
+    def __init__(self, *, has_any: bool, upsert_result: tuple[int, int] = (0, 0)) -> None:
+        self.has_any = has_any
+        self.upsert_result = upsert_result
+        self.has_any_calls: list[tuple[str, str]] = []
+        self.upsert_calls: list[tuple[str, str, list[dict[str, object]]]] = []
+
+    def has_any_for_athlete(self, *, user_id: str, athlete_id: str) -> bool:
+        self.has_any_calls.append((user_id, athlete_id))
+        return self.has_any
+
+    def upsert_many(self, *, user_id: str, athlete_id: str, activities: list[dict[str, object]]):
+        self.upsert_calls.append((user_id, athlete_id, activities))
+        return self.upsert_result
+
+
 def test_build_connect_url_includes_signed_state(monkeypatch) -> None:
     monkeypatch.setattr(strava_module.settings, "strava_client_id", "12345")
     monkeypatch.setattr(
@@ -137,6 +163,92 @@ def test_fetch_activities_uses_incremental_after_and_stops_on_short_page(monkeyp
         (1, 2, int(connection.last_sync_at.timestamp())),
         (2, 2, int(connection.last_sync_at.timestamp())),
     ]
+
+
+def test_enqueue_sync_promotes_first_sync_to_historical(monkeypatch) -> None:
+    db = DummyDB()
+    service = StravaService(db=db)
+    connection = SimpleNamespace(
+        provider_user_id="athlete-1",
+        last_sync_at=None,
+        token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        access_token=strava_module.encrypt_secret("access-1"),
+    )
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(has_any=False, upsert_result=(2, 0))
+
+    captured: list[bool] = []
+
+    def fake_fetch_activities(*, access_token: str, connection, full_sync: bool):
+        assert access_token == "access-1"  # noqa: S105
+        assert connection.provider_user_id == "athlete-1"
+        captured.append(full_sync)
+        return [{"id": 1}, {"id": 2}]
+
+    monkeypatch.setattr(service, "_fetch_activities", fake_fetch_activities)
+
+    response = service.enqueue_sync("user-abc", full_sync=False)
+
+    assert captured == [True]
+    assert response.job_type == "historical_import"
+    assert response.imported_count == 2
+    assert connection.last_sync_at is not None
+
+
+def test_enqueue_sync_promotes_empty_local_dataset_to_historical(monkeypatch) -> None:
+    db = DummyDB()
+    service = StravaService(db=db)
+    connection = SimpleNamespace(
+        provider_user_id="athlete-1",
+        last_sync_at=datetime(2026, 4, 5, 12, 0, tzinfo=UTC),
+        token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        access_token=strava_module.encrypt_secret("access-1"),
+    )
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(has_any=False, upsert_result=(1, 0))
+
+    captured: list[bool] = []
+
+    def fake_fetch_activities(*, access_token: str, connection, full_sync: bool):
+        assert access_token == "access-1"  # noqa: S105
+        captured.append(full_sync)
+        return [{"id": 10}]
+
+    monkeypatch.setattr(service, "_fetch_activities", fake_fetch_activities)
+
+    response = service.enqueue_sync("user-abc", full_sync=False)
+
+    assert captured == [True]
+    assert response.job_type == "historical_import"
+    assert response.imported_count == 1
+
+
+def test_enqueue_sync_keeps_incremental_when_history_exists(monkeypatch) -> None:
+    db = DummyDB()
+    service = StravaService(db=db)
+    connection = SimpleNamespace(
+        provider_user_id="athlete-1",
+        last_sync_at=datetime(2026, 4, 5, 12, 0, tzinfo=UTC),
+        token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        access_token=strava_module.encrypt_secret("access-1"),
+    )
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(has_any=True, upsert_result=(0, 1))
+
+    captured: list[bool] = []
+
+    def fake_fetch_activities(*, access_token: str, connection, full_sync: bool):
+        assert access_token == "access-1"  # noqa: S105
+        captured.append(full_sync)
+        return [{"id": 20}]
+
+    monkeypatch.setattr(service, "_fetch_activities", fake_fetch_activities)
+
+    response = service.enqueue_sync("user-abc", full_sync=False)
+
+    assert captured == [False]
+    assert response.job_type == "incremental_sync"
+    assert response.updated_count == 1
 
 
 def test_build_frontend_callback_redirect_includes_status_payload(monkeypatch) -> None:

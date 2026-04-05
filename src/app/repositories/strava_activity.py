@@ -12,6 +12,13 @@ class StravaActivityRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def has_any_for_athlete(self, *, user_id: str, athlete_id: str) -> bool:
+        stmt = select(StravaActivity.id).where(
+            StravaActivity.user_id == user_id,
+            StravaActivity.athlete_id == athlete_id,
+        )
+        return self.db.execute(stmt.limit(1)).scalar_one_or_none() is not None
+
     def upsert_many(self, *, user_id: str, athlete_id: str, activities: list[dict[str, object]]) -> tuple[int, int]:
         created = 0
         updated = 0
