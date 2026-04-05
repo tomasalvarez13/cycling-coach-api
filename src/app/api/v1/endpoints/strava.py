@@ -15,7 +15,7 @@ def connect_url() -> StravaConnectUrlResponse:
 
 
 @router.get("/status", response_model=StravaConnectionStatus)
-def status(current_user=Depends(get_current_user), db: DBSession = None) -> StravaConnectionStatus:
+def get_status(current_user=Depends(get_current_user), db: DBSession = None) -> StravaConnectionStatus:
     db = db or current_user._sa_instance_state.session
     return StravaService(db).get_connection_status(str(current_user.id))
 
