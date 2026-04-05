@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from typing import Annotated, Literal
 
@@ -40,7 +41,18 @@ class Settings(BaseSettings):
     @classmethod
     def parse_cors_origins(cls, value: object) -> object:
         if isinstance(value, str):
-            return [item.strip() for item in value.split(",") if item.strip()]
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, list):
+                        return [str(item).strip() for item in decoded if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
         return value
 
     @computed_field  # type: ignore[prop-decorator]
