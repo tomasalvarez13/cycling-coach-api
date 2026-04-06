@@ -20,6 +20,16 @@ class OAuthConnectionRepository:
         )
         return self.db.execute(stmt).scalar_one_or_none()
 
+    def get_active_by_provider_user_id(
+        self, *, provider: str, provider_user_id: str
+    ) -> OAuthConnection | None:
+        stmt = select(OAuthConnection).where(
+            OAuthConnection.provider == provider,
+            OAuthConnection.provider_user_id == provider_user_id,
+            OAuthConnection.is_active.is_(True),
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
     def upsert_strava_connection(
         self,
         *,

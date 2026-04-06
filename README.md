@@ -105,6 +105,9 @@ Variables clave:
 - `STRAVA_DEFAULT_ACTIVITY_LIMIT`: tamaño de sync incremental
 - `STRAVA_FULL_SYNC_MAX_PAGES`: máximo de páginas para import histórico en dev
 - `STRAVA_TOKEN_REFRESH_SKEW_SECONDS`: margen para refrescar token antes del vencimiento real
+- `STRAVA_WEBHOOK_VERIFY_TOKEN`: token compartido que Strava usa para verificar la suscripción webhook
+- `STRAVA_WEBHOOK_CALLBACK_URL`: URL pública dev del endpoint `GET/POST /api/v1/strava/webhook`
+- `STRAVA_WEBHOOK_SUBSCRIPTION_ID`: id dev de la subscription creada en Strava (informativo por ahora)
 - `TOKEN_ENCRYPTION_SECRET`: secreto para cifrar access/refresh tokens persistidos
 
 ## Instalación
@@ -135,6 +138,8 @@ Endpoints principales:
 - `POST /api/v1/auth/login`
 - `GET /api/v1/auth/me`
 - `GET /api/v1/athletes/me`
+- `GET /api/v1/strava/webhook`
+- `POST /api/v1/strava/webhook`
 - `GET /api/v1/strava/connect-url`
 - `GET /api/v1/strava/callback`
 - `GET /api/v1/strava/status`
@@ -145,8 +150,9 @@ Endpoints principales:
 1. El frontend autenticado pide `GET /api/v1/strava/connect-url`.
 2. Redirige al usuario a `authorize_url` en Strava.
 3. Strava vuelve a `STRAVA_REDIRECT_URI` (`/api/v1/strava/callback`).
-4. El backend intercambia el `code`, persiste tokens cifrados y redirige a `STRAVA_FRONTEND_REDIRECT_URI` con query params de estado (`state`, `status`, `connected`, `athlete_id`, `scopes`, `token_expires_at`). Si falla el callback y la petición no pide JSON, también redirige al frontend con `error` y `message`.
-5. El frontend puede refrescar `GET /api/v1/strava/status` y disparar `POST /api/v1/strava/sync`.
+4. El backend intercambia el `code`, persiste tokens cifrados y dispara un import histórico inicial para dejar poblada la base propia desde la primera conexión.
+5. El callback responde/redirige con el estado de conexión y del import inicial (`state`, `status`, `connected`, `athlete_id`, `scopes`, `token_expires_at`, `last_sync_at`, `initial_sync_completed`, `initial_sync_error`, `imported_count`, `updated_count`). Si falla el callback y la petición no pide JSON, también redirige al frontend con `error` y `message`.
+6. A partir de ahí el frontend lee desde la DB vía `GET /api/v1/strava/status`, `GET /api/v1/strava/activities`, `GET /api/v1/strava/activities/overview` y sólo usa `POST /api/v1/strava/sync` para refrescar ingestión.
 
 Notas de implementación actuales:
 
@@ -155,6 +161,39 @@ Notas de implementación actuales:
 - El backend refresca el access token antes de expirar usando `STRAVA_TOKEN_REFRESH_SKEW_SECONDS`.
 - El sync incremental usa `last_sync_at` como cursor (`after`).
 - El full sync pagina hasta `STRAVA_FULL_SYNC_MAX_PAGES` para no descontrolarse en dev.
+- El webhook MVP soporta verificación de suscripción (`hub.challenge`) y eventos `activity` con `aspect_type=create|update`.
+- Cuando llega un webhook válido, el backend busca la conexión Strava activa por `owner_id` (athlete id), refresca token si hace falta, pide el detalle actual de la actividad a Strava y hace upsert en `strava_activities`.
+- Los eventos ignorados por ahora: `delete` y objetos no `activity`. Quedan registrados de forma implícita por la respuesta del endpoint, pero no borran datos locales.
+
+### Webhook Strava en dev
+
+Endpoint listo en backend:
+
+- Verify: `GET /api/v1/strava/webhook`
+- Receive: `POST /api/v1/strava/webhook`
+
+Qué falta para activarlo contra Strava dev:
+
+1. Exponer una URL pública HTTPS que apunte al backend local/dev.
+2. Configurar `STRAVA_WEBHOOK_VERIFY_TOKEN` con un secreto compartido.
+3. Configurar `STRAVA_WEBHOOK_CALLBACK_URL` con esa URL pública final.
+4. Crear la subscription en Strava Developer API apuntando a esa callback URL y guardarse el `id` dev resultante en `STRAVA_WEBHOOK_SUBSCRIPTION_ID`.
+
+Ejemplo conceptual de alta de subscription (fuera de esta API, contra Strava):
+
+```bash
+curl -X POST https://www.strava.com/api/v3/push_subscriptions \
+  -F client_id="$STRAVA_CLIENT_ID" \
+  -F client_secret="$STRAVA_CLIENT_SECRET" \
+  -F callback_url="$STRAVA_WEBHOOK_CALLBACK_URL" \
+  -F verify_token="$STRAVA_WEBHOOK_VERIFY_TOKEN"
+```
+
+Notas:
+
+- Esto debe hacerse solo con credenciales/dev callback de desarrollo, no prod.
+- El backend ya valida el verify token y procesa el POST.
+- `STRAVA_WEBHOOK_SUBSCRIPTION_ID` hoy es documental/operativo; no bloquea el procesamiento.
 
 ## Testing
 

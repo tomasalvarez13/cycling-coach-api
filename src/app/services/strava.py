@@ -29,6 +29,9 @@ from app.schemas.strava import (
     StravaOAuthCallbackResponse,
     StravaRecentVolume,
     StravaSyncJobResponse,
+    StravaWebhookEvent,
+    StravaWebhookEventResponse,
+    StravaWebhookSubscriptionChallengeResponse,
 )
 
 settings = get_settings()
@@ -39,6 +42,107 @@ class StravaService:
         self.db = db
         self.connections = OAuthConnectionRepository(db) if db is not None else None
         self.activities = StravaActivityRepository(db) if db is not None else None
+
+    def verify_webhook_subscription(
+        self, *, mode: str, verify_token: str, challenge: str
+    ) -> StravaWebhookSubscriptionChallengeResponse:
+        if mode != "subscribe":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported Strava webhook mode",
+            )
+        if not settings.strava_webhook_verify_token:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Strava webhook verify token not configured",
+            )
+        if verify_token != settings.strava_webhook_verify_token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid Strava webhook verify token",
+            )
+        return StravaWebhookSubscriptionChallengeResponse.model_validate(
+            {"hub.challenge": challenge}
+        )
+
+    def handle_webhook_event(self, payload: StravaWebhookEvent) -> StravaWebhookEventResponse:
+        if self.db is None or self.connections is None or self.activities is None:
+            raise RuntimeError("Database session required")
+
+        if payload.object_type != "activity":
+            return StravaWebhookEventResponse(
+                accepted=False,
+                processed=False,
+                reason="unsupported_object_type",
+            )
+
+        if payload.aspect_type not in {"create", "update"}:
+            return StravaWebhookEventResponse(
+                accepted=True,
+                processed=False,
+                reason="ignored_aspect_type",
+                provider_activity_id=str(payload.object_id),
+            )
+
+        connection = self.connections.get_active_by_provider_user_id(
+            provider="strava",
+            provider_user_id=str(payload.owner_id),
+        )
+        if connection is None:
+            return StravaWebhookEventResponse(
+                accepted=True,
+                processed=False,
+                reason="connection_not_found",
+                provider_activity_id=str(payload.object_id),
+            )
+
+        started_at = datetime.now(UTC)
+        try:
+            access_token = self._get_valid_access_token(connection)
+            activity_payload = self._fetch_activity_detail_from_provider(
+                access_token=access_token,
+                provider_activity_id=str(payload.object_id),
+            )
+            created, updated = self.activities.upsert_many(
+                user_id=str(connection.user_id),
+                athlete_id=connection.provider_user_id,
+                activities=[activity_payload],
+            )
+            connection.last_sync_at = datetime.now(UTC)
+            self.db.add(connection)
+            self.db.add(
+                SyncJob(
+                    user_id=connection.user_id,
+                    provider="strava",
+                    job_type="webhook_activity_upsert",
+                    status="completed",
+                    payload_json={
+                        "event": payload.model_dump(),
+                        "provider_activity_id": str(payload.object_id),
+                        "imported_count": created,
+                        "updated_count": updated,
+                    },
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                )
+            )
+            self.db.commit()
+            return StravaWebhookEventResponse(
+                accepted=True,
+                processed=True,
+                user_id=str(connection.user_id),
+                provider_activity_id=str(payload.object_id),
+                imported_count=created,
+                updated_count=updated,
+            )
+        except HTTPException as exc:
+            self._record_webhook_failure(
+                user_id=str(connection.user_id),
+                started_at=started_at,
+                payload=payload,
+                error_message=str(exc.detail),
+            )
+            raise
 
     def build_connect_url(self, *, user_id: str) -> StravaConnectUrlResponse:
         if not settings.strava_client_id or not settings.strava_redirect_uri:
@@ -91,7 +195,7 @@ class StravaService:
             or None
         )
 
-        self.connections.upsert_strava_connection(
+        connection = self.connections.upsert_strava_connection(
             user_id=str(user_id),
             provider_user_id=athlete_id,
             access_token=encrypt_secret(str(token_payload["access_token"])),
@@ -106,6 +210,27 @@ class StravaService:
         )
         self.db.commit()
 
+        imported_count = 0
+        updated_count = 0
+        initial_sync_completed = False
+        initial_sync_error = None
+
+        try:
+            sync_result = self._run_sync(
+                user_id=str(user_id),
+                connection=connection,
+                full_sync=True,
+            )
+        except HTTPException as exc:
+            initial_sync_error = str(exc.detail)
+        else:
+            imported_count = sync_result.imported_count
+            updated_count = sync_result.updated_count
+            initial_sync_completed = True
+            connection = self.connections.get_active_for_user(
+                user_id=str(user_id), provider="strava"
+            ) or connection
+
         redirect_to = self._build_frontend_callback_redirect(
             state=state,
             connected=True,
@@ -119,6 +244,11 @@ class StravaService:
             athlete_name=athlete_name,
             scopes=scopes,
             token_expires_at=expires_at,
+            last_sync_at=connection.last_sync_at,
+            initial_sync_completed=initial_sync_completed,
+            initial_sync_error=initial_sync_error,
+            imported_count=imported_count,
+            updated_count=updated_count,
             redirect_to=redirect_to,
         )
 
@@ -217,6 +347,14 @@ class StravaService:
         connection = self.connections.get_active_for_user(user_id=user_id, provider="strava")
         if connection is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Strava not connected")
+
+        return self._run_sync(user_id=user_id, connection=connection, full_sync=full_sync)
+
+    def _run_sync(
+        self, *, user_id: str, connection: OAuthConnection, full_sync: bool
+    ) -> StravaSyncJobResponse:
+        if self.db is None or self.activities is None:
+            raise RuntimeError("Database session required")
 
         has_existing_activities = self.activities.has_any_for_athlete(
             user_id=user_id,
@@ -416,6 +554,27 @@ class StravaService:
             )
         return payload
 
+    def _fetch_activity_detail_from_provider(
+        self, *, access_token: str, provider_activity_id: str
+    ) -> dict[str, object]:
+        response = httpx.get(
+            f"https://www.strava.com/api/v3/activities/{provider_activity_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20.0,
+        )
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Strava activity detail fetch failed",
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Unexpected Strava activity detail payload",
+            )
+        return payload
+
     def _record_sync_failure(
         self, *, user_id: str, full_sync: bool, started_at: datetime, error_message: str
     ) -> None:
@@ -432,6 +591,30 @@ class StravaService:
             finished_at=datetime.now(UTC),
         )
         self.db.add(job)
+        self.db.commit()
+
+    def _record_webhook_failure(
+        self,
+        *,
+        user_id: str,
+        started_at: datetime,
+        payload: StravaWebhookEvent,
+        error_message: str,
+    ) -> None:
+        if self.db is None:
+            return
+        self.db.add(
+            SyncJob(
+                user_id=user_id,
+                provider="strava",
+                job_type="webhook_activity_upsert",
+                status="failed",
+                error_message=error_message,
+                payload_json={"event": payload.model_dump(), "requested_at": started_at.isoformat()},
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+            )
+        )
         self.db.commit()
 
     def build_frontend_callback_error_redirect(
@@ -492,6 +675,7 @@ class StravaService:
         return self.activities
 
     def _serialize_activity_summary(self, activity: StravaActivity) -> StravaActivitySummary:
+        map_data = _extract_map_data(activity.raw_json)
         return StravaActivitySummary(
             id=str(activity.id),
             provider_activity_id=activity.provider_activity_id,
@@ -506,13 +690,59 @@ class StravaService:
             total_elevation_gain=activity.total_elevation_gain,
             average_speed_mps=activity.average_speed_mps,
             max_speed_mps=activity.max_speed_mps,
+            has_map=map_data["has_map"],
+            map_summary_polyline=map_data["summary_polyline"],
+            start_latlng=map_data["start_latlng"],
+            end_latlng=map_data["end_latlng"],
             synced_at=activity.synced_at,
         )
 
     def _serialize_activity_detail(self, activity: StravaActivity) -> StravaActivityDetail:
+        map_data = _extract_map_data(activity.raw_json)
         return StravaActivityDetail(
             **self._serialize_activity_summary(activity).model_dump(),
+            map_polyline=map_data["polyline"],
             raw_json=activity.raw_json,
             created_at=activity.created_at,
             updated_at=activity.updated_at,
         )
+
+
+def _extract_map_data(raw_json: dict[str, object] | None) -> dict[str, object]:
+    map_payload = raw_json.get("map") if isinstance(raw_json, dict) else None
+    if not isinstance(map_payload, dict):
+        return {
+            "has_map": False,
+            "summary_polyline": None,
+            "polyline": None,
+            "start_latlng": None,
+            "end_latlng": None,
+        }
+
+    summary_polyline = _optional_str(map_payload.get("summary_polyline"))
+    polyline = _optional_str(map_payload.get("polyline"))
+    start_latlng = _optional_latlng(raw_json.get("start_latlng")) if isinstance(raw_json, dict) else None
+    end_latlng = _optional_latlng(raw_json.get("end_latlng")) if isinstance(raw_json, dict) else None
+    return {
+        "has_map": bool(summary_polyline or polyline),
+        "summary_polyline": summary_polyline,
+        "polyline": polyline,
+        "start_latlng": start_latlng,
+        "end_latlng": end_latlng,
+    }
+
+
+def _optional_latlng(value: object) -> list[float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        return [float(value[0]), float(value[1])]
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    result = str(value).strip()
+    return result or None

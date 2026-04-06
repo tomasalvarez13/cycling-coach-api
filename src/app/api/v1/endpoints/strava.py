@@ -15,10 +15,34 @@ from app.schemas.strava import (
     StravaOAuthCallbackResponse,
     StravaSyncJobResponse,
     StravaSyncRequest,
+    StravaWebhookEvent,
+    StravaWebhookEventResponse,
+    StravaWebhookSubscriptionChallengeResponse,
 )
 from app.services.strava import StravaService
 
 router = APIRouter(prefix="/strava", tags=["strava"])
+
+
+@router.get("/webhook", response_model=StravaWebhookSubscriptionChallengeResponse)
+def verify_webhook(
+    hub_mode: str = Query(..., alias="hub.mode"),
+    hub_verify_token: str = Query(..., alias="hub.verify_token"),
+    hub_challenge: str = Query(..., alias="hub.challenge"),
+) -> StravaWebhookSubscriptionChallengeResponse:
+    return StravaService(None).verify_webhook_subscription(
+        mode=hub_mode,
+        verify_token=hub_verify_token,
+        challenge=hub_challenge,
+    )
+
+
+@router.post("/webhook", response_model=StravaWebhookEventResponse)
+def receive_webhook(
+    payload: StravaWebhookEvent,
+    db: DBSession,
+) -> StravaWebhookEventResponse:
+    return StravaService(db).handle_webhook_event(payload)
 
 
 @router.get("/connect-url", response_model=StravaConnectUrlResponse)

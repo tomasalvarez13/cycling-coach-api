@@ -11,6 +11,32 @@ class StravaConnectUrlResponse(BaseModel):
     state: str
 
 
+class StravaWebhookSubscriptionChallengeResponse(BaseModel):
+    hub_challenge: str = Field(alias="hub.challenge")
+
+    model_config = {"populate_by_name": True}
+
+
+class StravaWebhookEvent(BaseModel):
+    aspect_type: str
+    event_time: int
+    object_id: int
+    object_type: str
+    owner_id: int
+    subscription_id: int
+    updates: dict[str, Any] = Field(default_factory=dict)
+
+
+class StravaWebhookEventResponse(BaseModel):
+    accepted: bool
+    processed: bool
+    reason: str | None = None
+    user_id: str | None = None
+    provider_activity_id: str | None = None
+    imported_count: int = 0
+    updated_count: int = 0
+
+
 class StravaConnectionStatus(BaseModel):
     connected: bool
     provider: str = "strava"
@@ -41,6 +67,11 @@ class StravaOAuthCallbackResponse(BaseModel):
     athlete_name: str | None = None
     scopes: list[str] = Field(default_factory=list)
     token_expires_at: datetime
+    last_sync_at: datetime | None = None
+    initial_sync_completed: bool = False
+    initial_sync_error: str | None = None
+    imported_count: int = 0
+    updated_count: int = 0
     redirect_to: HttpUrl | None = None
 
 
@@ -58,10 +89,15 @@ class StravaActivitySummary(BaseModel):
     total_elevation_gain: float | None = None
     average_speed_mps: float | None = None
     max_speed_mps: float | None = None
+    has_map: bool = False
+    map_summary_polyline: str | None = None
+    start_latlng: list[float] | None = None
+    end_latlng: list[float] | None = None
     synced_at: datetime
 
 
 class StravaActivityDetail(StravaActivitySummary):
+    map_polyline: str | None = None
     raw_json: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime

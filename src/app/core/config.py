@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     strava_default_activity_limit: int = 30
     strava_full_sync_max_pages: int = 10
     strava_token_refresh_skew_seconds: int = 300
+    strava_webhook_verify_token: str | None = None
+    strava_webhook_callback_url: str | None = None
+    strava_webhook_subscription_id: str | None = None
     token_encryption_secret: str | None = None
 
     @field_validator("cors_origins", mode="before")

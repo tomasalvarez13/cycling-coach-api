@@ -33,10 +33,30 @@ class DummyDB:
 class FakeConnections:
     def __init__(self, connection) -> None:
         self.connection = connection
+        self.upsert_calls: list[dict[str, object]] = []
 
     def get_active_for_user(self, *, user_id: str, provider: str):
         assert user_id == "user-abc"
         assert provider == "strava"
+        return self.connection
+
+    def get_active_by_provider_user_id(self, *, provider: str, provider_user_id: str):
+        assert provider == "strava"
+        if self.connection is None:
+            return None
+        return self.connection if self.connection.provider_user_id == provider_user_id else None
+
+    def upsert_strava_connection(self, **kwargs):
+        self.upsert_calls.append(kwargs)
+        for field in (
+            "provider_user_id",
+            "access_token",
+            "refresh_token",
+            "token_expires_at",
+            "scopes",
+            "metadata_json",
+        ):
+            setattr(self.connection, field, kwargs[field])
         return self.connection
 
 
@@ -111,10 +131,44 @@ def _make_activity(*, provider_activity_id: str, name: str = "Morning Ride"):
         average_speed_mps=7.8,
         max_speed_mps=15.2,
         synced_at=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
-        raw_json={"id": int(provider_activity_id), "name": name},
+        raw_json={
+            "id": int(provider_activity_id),
+            "name": name,
+            "map": {
+                "summary_polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@",
+                "polyline": "_p~iF~ps|U_ulLnnqC_mqNvxq`@",
+            },
+            "start_latlng": [38.5, -120.2],
+            "end_latlng": [43.252, -126.453],
+        },
         created_at=datetime(2026, 4, 5, 9, 0, tzinfo=UTC),
         updated_at=datetime(2026, 4, 5, 9, 5, tzinfo=UTC),
     )
+
+
+def test_verify_webhook_subscription_returns_challenge(monkeypatch) -> None:
+    monkeypatch.setattr(strava_module.settings, "strava_webhook_verify_token", "verify-me")
+
+    response = StravaService(None).verify_webhook_subscription(
+        mode="subscribe",
+        verify_token="verify-me",
+        challenge="challenge-123",
+    )
+
+    assert response.model_dump(by_alias=True) == {"hub.challenge": "challenge-123"}
+
+
+def test_verify_webhook_subscription_rejects_wrong_token(monkeypatch) -> None:
+    monkeypatch.setattr(strava_module.settings, "strava_webhook_verify_token", "verify-me")
+
+    with pytest.raises(HTTPException) as exc_info:
+        StravaService(None).verify_webhook_subscription(
+            mode="subscribe",
+            verify_token="wrong-token",
+            challenge="challenge-123",
+        )
+
+    assert exc_info.value.status_code == 403
 
 
 def test_build_connect_url_includes_signed_state(monkeypatch) -> None:
@@ -129,6 +183,84 @@ def test_build_connect_url_includes_signed_state(monkeypatch) -> None:
 
     assert "client_id=12345" in str(response.authorize_url)
     assert response.state
+
+
+def test_handle_callback_runs_initial_sync_and_returns_sync_status(monkeypatch) -> None:
+    db = DummyDB()
+    connection = SimpleNamespace(last_sync_at=None)
+    service = StravaService(db=db)
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(has_any=False, upsert_result=(2, 0))
+
+    monkeypatch.setattr(strava_module, "decode_signed_state", lambda _: {"user_id": "user-abc"})
+    monkeypatch.setattr(
+        service,
+        "_exchange_code_for_token",
+        lambda _: {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_at": int((datetime.now(UTC) + timedelta(hours=6)).timestamp()),
+            "scope": "read,activity:read_all",
+            "athlete": {"id": 42, "firstname": "Tom", "lastname": "Alvarez"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_fetch_activities",
+        lambda **kwargs: [
+            {"id": 1, "start_date": "2026-04-05T07:00:00Z", "name": "Ride 1"},
+            {"id": 2, "start_date": "2026-04-04T07:00:00Z", "name": "Ride 2"},
+        ],
+    )
+    monkeypatch.setattr(service, "_build_frontend_callback_redirect", lambda **kwargs: None)
+
+    response = service.handle_callback(code="code-1", state="state-1", scope=None)
+
+    assert response.connected is True
+    assert response.initial_sync_completed is True
+    assert response.initial_sync_error is None
+    assert response.imported_count == 2
+    assert response.updated_count == 0
+    assert response.last_sync_at is not None
+    assert db.commits == 2
+
+
+def test_handle_callback_keeps_connection_when_initial_sync_fails(monkeypatch) -> None:
+    db = DummyDB()
+    connection = SimpleNamespace(last_sync_at=None)
+    service = StravaService(db=db)
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(has_any=False)
+
+    monkeypatch.setattr(strava_module, "decode_signed_state", lambda _: {"user_id": "user-abc"})
+    monkeypatch.setattr(
+        service,
+        "_exchange_code_for_token",
+        lambda _: {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_at": int((datetime.now(UTC) + timedelta(hours=6)).timestamp()),
+            "scope": "read,activity:read_all",
+            "athlete": {"id": 42, "firstname": "Tom", "lastname": "Alvarez"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_fetch_activities",
+        lambda **kwargs: (_ for _ in ()).throw(
+            HTTPException(status_code=502, detail="Strava activities fetch failed")
+        ),
+    )
+    monkeypatch.setattr(service, "_build_frontend_callback_redirect", lambda **kwargs: None)
+
+    response = service.handle_callback(code="code-1", state="state-1", scope=None)
+
+    assert response.connected is True
+    assert response.initial_sync_completed is False
+    assert response.initial_sync_error == "Strava activities fetch failed"
+    assert response.imported_count == 0
+    assert response.updated_count == 0
+    assert db.commits == 2
 
 
 def test_get_connection_status_without_connection() -> None:
@@ -168,7 +300,12 @@ def test_get_activity_detail_returns_raw_payload() -> None:
     response = service.get_activity_detail("user-abc", provider_activity_id="555")
 
     assert response.provider_activity_id == "555"
-    assert response.raw_json == {"id": 555, "name": "Morning Ride"}
+    assert response.has_map is True
+    assert response.map_summary_polyline == "_p~iF~ps|U_ulLnnqC_mqNvxq`@"
+    assert response.map_polyline == "_p~iF~ps|U_ulLnnqC_mqNvxq`@"
+    assert response.start_latlng == [38.5, -120.2]
+    assert response.end_latlng == [43.252, -126.453]
+    assert response.raw_json["id"] == 555
 
 
 def test_get_activity_detail_raises_404_when_missing() -> None:
@@ -403,6 +540,97 @@ def test_enqueue_sync_keeps_incremental_when_history_exists(monkeypatch) -> None
     assert captured == [False]
     assert response.job_type == "incremental_sync"
     assert response.updated_count == 1
+
+
+def test_handle_webhook_event_upserts_activity_for_connected_athlete(monkeypatch) -> None:
+    db = DummyDB()
+    service = StravaService(db=db)
+    connection = SimpleNamespace(
+        user_id=uuid4(),
+        provider_user_id="42",
+        last_sync_at=None,
+        token_expires_at=datetime.now(UTC) + timedelta(hours=1),
+        access_token=strava_module.encrypt_secret("access-1"),
+    )
+    service.connections = FakeConnections(connection)
+    service.activities = FakeActivities(upsert_result=(0, 1))
+
+    monkeypatch.setattr(
+        service,
+        "_fetch_activity_detail_from_provider",
+        lambda *, access_token, provider_activity_id: {
+            "id": int(provider_activity_id),
+            "name": "Webhook Ride",
+            "sport_type": "Ride",
+            "start_date": "2026-04-05T07:00:00Z",
+            "distance": 50000.0,
+        },
+    )
+
+    response = service.handle_webhook_event(
+        strava_module.StravaWebhookEvent(
+            aspect_type="update",
+            event_time=1712367360,
+            object_id=12345,
+            object_type="activity",
+            owner_id=42,
+            subscription_id=99,
+            updates={"title": "Webhook Ride"},
+        )
+    )
+
+    assert response.accepted is True
+    assert response.processed is True
+    assert response.provider_activity_id == "12345"
+    assert response.updated_count == 1
+    assert service.activities.upsert_calls[0][0] == str(connection.user_id)
+    assert service.activities.upsert_calls[0][2][0]["id"] == 12345
+    assert connection.last_sync_at is not None
+    assert db.commits >= 1
+
+
+def test_handle_webhook_event_ignores_when_connection_missing() -> None:
+    service = StravaService(db=DummyDB())
+    service.connections = FakeConnections(None)
+    service.activities = FakeActivities()
+
+    response = service.handle_webhook_event(
+        strava_module.StravaWebhookEvent(
+            aspect_type="create",
+            event_time=1712367360,
+            object_id=12345,
+            object_type="activity",
+            owner_id=999,
+            subscription_id=99,
+            updates={},
+        )
+    )
+
+    assert response.accepted is True
+    assert response.processed is False
+    assert response.reason == "connection_not_found"
+
+
+def test_handle_webhook_event_ignores_non_activity_objects() -> None:
+    service = StravaService(db=DummyDB())
+    service.connections = FakeConnections(None)
+    service.activities = FakeActivities()
+
+    response = service.handle_webhook_event(
+        strava_module.StravaWebhookEvent(
+            aspect_type="create",
+            event_time=1712367360,
+            object_id=12345,
+            object_type="athlete",
+            owner_id=1,
+            subscription_id=99,
+            updates={},
+        )
+    )
+
+    assert response.accepted is False
+    assert response.processed is False
+    assert response.reason == "unsupported_object_type"
 
 
 def test_build_frontend_callback_redirect_includes_status_payload(monkeypatch) -> None:
